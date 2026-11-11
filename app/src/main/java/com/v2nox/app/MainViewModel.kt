@@ -18,8 +18,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import java.net.URI
 import java.util.UUID
 
 data class MainUiState(
@@ -27,6 +27,8 @@ data class MainUiState(
     val activeConfig: ServerConfig? = null,
     val savedConfigs: List<ServerConfig> = emptyList(),
     val errorMessage: String? = null,
+    val pingResults: Map<String, Long> = emptyMap(),
+    val pingingServerId: String? = null,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -40,6 +42,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var service: V2NoxVpnService? = null
     private var boundContext: Context? = null
     private var pendingConfig: ServerConfig? = null
+    private var pingJob: Job? = null
+    private var lastPingTarget: Triple<String, String, Int>? = null
 
     init {
         viewModelScope.launch {
@@ -50,6 +54,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     savedConfigs = configs,
                     activeConfig = configs.firstOrNull { it.id == activeId },
                 )
+                val active = configs.firstOrNull { it.id == activeId }
+                val pingTarget = active?.let { Triple(it.id, it.address, it.port) }
+                if (pingTarget != lastPingTarget) {
+                    lastPingTarget = pingTarget
+                    active?.let(::refreshPing)
+                }
             }
         }
     }
@@ -61,13 +71,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             viewModelScope.launch {
                 instance.state.collect { value -> mutableUiState.value = mutableUiState.value.copy(vpnState = value) }
             }
+            viewModelScope.launch {
+                instance.error.collect { message ->
+                    mutableUiState.value = mutableUiState.value.copy(errorMessage = message)
+                }
+            }
             pendingConfig?.also { pendingConfig = null; instance.startVpn(it) }
         }
         override fun onServiceDisconnected(name: ComponentName?) { service = null }
     }
 
     fun importFromClipboard(text: String) {
-        runCatching { VlessParser.parse(text) }
+        runCatching { ServerLinkParser.parse(text) }
             .onSuccess { parsed ->
                 val existing = mutableUiState.value.savedConfigs
                 if (existing.none { it.rawUrl == parsed.rawUrl }) {
@@ -90,7 +105,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectConfig(config: ServerConfig) {
         mutableUiState.value = mutableUiState.value.copy(activeConfig = config, errorMessage = null)
+        refreshPing(config)
         viewModelScope.launch { serverRepository.setActiveServerId(config.id) }
+    }
+
+    fun refreshPing(config: ServerConfig? = mutableUiState.value.activeConfig) {
+        config ?: return
+        pingJob?.cancel()
+        mutableUiState.value = mutableUiState.value.copy(pingingServerId = config.id)
+        pingJob = viewModelScope.launch {
+            val result = serverRepository.measurePing(config)
+            val current = mutableUiState.value
+            mutableUiState.value = current.copy(
+                pingResults = current.pingResults + (config.id to result),
+                pingingServerId = current.pingingServerId.takeUnless { it == config.id },
+            )
+        }
     }
 
     fun deleteConfig(config: ServerConfig) {
@@ -142,20 +172,134 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 }
 
-/** Parses the common vless://uuid@host:port?security=...#name form. */
-object VlessParser {
+/** Imports the share-link formats commonly used by Xray-compatible clients. */
+object ServerLinkParser {
+    private val supportedSchemes = setOf("vless", "vmess", "trojan", "ss", "shadowsocks", "hysteria2", "hy2", "tuic", "wireguard")
+
     fun parse(text: String): ServerConfig {
-        val link = text.trim().lineSequence().firstOrNull { it.trim().startsWith("vless://", ignoreCase = true) }?.trim()
-            ?: error("В буфере не найден vless:// конфиг")
-        val uri = URI(link)
-        require(uri.scheme.equals("vless", ignoreCase = true)) { "Поддерживаются только VLESS-конфигурации" }
-        val host = uri.host ?: error("В конфигурации отсутствует адрес сервера")
-        val port = uri.port.takeIf { it in 1..65535 } ?: error("Некорректный порт сервера")
-        val name = uri.rawFragment?.let { java.net.URLDecoder.decode(it, Charsets.UTF_8.name()) }
-            ?.takeIf { it.isNotBlank() } ?: host
-        val security = uri.rawQuery?.split('&')?.firstNotNullOfOrNull { part ->
-            part.split('=', limit = 2).takeIf { it.size == 2 && it[0] == "security" }?.get(1)
+        val link = text.trim().lineSequence().map(String::trim).firstOrNull { candidate ->
+            candidate.substringBefore("://").lowercase() in supportedSchemes && "://" in candidate
+        } ?: error("В буфере не найдена поддерживаемая ссылка Xray")
+        val scheme = link.substringBefore("://").lowercase()
+        val protocol = when (scheme) {
+            "ss", "shadowsocks" -> "SHADOWSOCKS"
+            "hy2", "hysteria2" -> "HYSTERIA2"
+            else -> scheme.uppercase()
         }
-        return ServerConfig(UUID.randomUUID().toString(), name, host, port, link, security)
+        val parts = when (scheme) {
+            "vmess" -> parseVmess(link)
+            "ss", "shadowsocks" -> parseShadowsocks(link)
+            else -> parseUri(link)
+        }
+        val (host, port) = parts.host to parts.port
+        require(host.isNotBlank()) { "В конфигурации отсутствует адрес сервера" }
+        require(port in 1..65535) { "Некорректный порт сервера" }
+        val name = parts.name?.takeIf(String::isNotBlank) ?: host
+        val security = parts.values["security"] ?: when (scheme) {
+            "trojan", "hysteria2", "hy2", "tuic" -> "tls"
+            else -> null
+        }
+        return ServerConfig(UUID.randomUUID().toString(), name, host, port, link, security, protocol)
     }
+
+    internal data class LinkParts(
+        val host: String,
+        val port: Int,
+        val name: String?,
+        val values: Map<String, String>,
+        val username: String? = null,
+        val password: String? = null,
+    )
+
+    internal fun parseRawLink(link: String): LinkParts = when (link.substringBefore("://").lowercase()) {
+        "vmess" -> parseVmess(link)
+        "ss", "shadowsocks" -> parseShadowsocks(link)
+        else -> parseUri(link)
+    }
+
+    private fun parseUri(link: String): LinkParts {
+        val uri = java.net.URI(link)
+        val values = decodeQuery(uri.rawQuery)
+        val userInfo = uri.rawUserInfo?.let(::decode)
+        return LinkParts(
+            host = uri.host ?: error("В конфигурации отсутствует адрес сервера"),
+            port = uri.port,
+            name = uri.rawFragment?.let(::decode),
+            values = values,
+            username = userInfo?.substringBefore(':'),
+            password = userInfo?.substringAfter(':', missingDelimiterValue = "")?.takeIf { ':' in userInfo },
+        )
+    }
+
+    private fun parseVmess(link: String): LinkParts {
+        val payload = link.substringAfter("://").substringBefore('#')
+        val json = runCatching { decodeBase64(payload) }.getOrElse { error("Некорректная VMess-ссылка") }
+        val item = runCatching { org.json.JSONObject(json) }.getOrElse { error("Некорректные данные VMess") }
+        val values = buildMap {
+            put("id", item.optString("id"))
+            put("aid", item.optString("aid", "0"))
+            put("scy", item.optString("scy", item.optString("security", "auto")))
+            put("net", item.optString("net", "tcp"))
+            put("type", item.optString("type", "none"))
+            put("host", item.optString("host"))
+            put("path", item.optString("path"))
+            put("tls", item.optString("tls"))
+            put("sni", item.optString("sni"))
+            put("fp", item.optString("fp"))
+        }
+        val host = item.optString("add").takeIf(String::isNotBlank) ?: error("В конфигурации VMess отсутствует адрес сервера")
+        val port = item.optString("port").toIntOrNull() ?: error("Некорректный порт сервера")
+        return LinkParts(host, port, item.optString("ps").takeIf(String::isNotBlank), values)
+    }
+
+    private fun parseShadowsocks(link: String): LinkParts {
+        val body = link.substringAfter("://").substringBefore('#')
+        val userAt = body.lastIndexOf('@')
+        val userInfo: String
+        val server: String
+        if (userAt >= 0) {
+            userInfo = body.substring(0, userAt)
+            server = body.substring(userAt + 1)
+        } else {
+            val decoded = runCatching { decodeBase64(body) }.getOrElse { error("Некорректная Shadowsocks-ссылка") }
+            val split = decoded.lastIndexOf('@')
+            require(split > 0) { "В Shadowsocks-ссылке отсутствуют параметры шифрования" }
+            userInfo = decoded.substring(0, split)
+            server = decoded.substring(split + 1)
+        }
+        val credentials = runCatching { decodeBase64(userInfo) }.getOrDefault(decode(userInfo))
+        val colon = credentials.indexOf(':')
+        require(colon > 0) { "Некорректные параметры Shadowsocks" }
+        val uri = java.net.URI("ss://$server")
+        val fragment = link.substringAfter('#', "").takeIf(String::isNotBlank)?.let(::decode)
+        return LinkParts(
+            host = uri.host ?: error("В конфигурации отсутствует адрес сервера"),
+            port = uri.port,
+            name = fragment,
+            values = mapOf("method" to credentials.substring(0, colon)),
+            username = credentials.substring(0, colon),
+            password = credentials.substring(colon + 1),
+        )
+    }
+
+    private fun decodeQuery(query: String?): Map<String, String> = query.orEmpty()
+        .split('&').mapNotNull { entry ->
+            if (entry.isBlank()) return@mapNotNull null
+            val split = entry.split('=', limit = 2)
+            decode(split[0]) to decode(split.getOrElse(1) { "" })
+        }.toMap()
+
+    private fun decode(value: String): String = java.net.URLDecoder.decode(value.replace("+", "%2B"), Charsets.UTF_8.name())
+
+    private fun decodeBase64(value: String): String {
+        val normalized = value.replace('-', '+').replace('_', '/')
+        val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
+        return String(android.util.Base64.decode(padded, android.util.Base64.DEFAULT), Charsets.UTF_8)
+    }
+}
+
+/** Kept as a source-compatible alias for clients which used the original parser name. */
+@Deprecated("Use ServerLinkParser")
+object VlessParser {
+    fun parse(text: String): ServerConfig = ServerLinkParser.parse(text)
 }

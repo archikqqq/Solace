@@ -6,8 +6,12 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.InetSocketAddress
+import java.net.Socket
 
 private val Context.serverPreferences by preferencesDataStore(name = "servers")
 
@@ -20,6 +24,16 @@ class ServerRepository(context: Context) {
 
     val activeServerId: Flow<String?> = dataStore.data.map { preferences ->
         preferences[ACTIVE_SERVER_ID_KEY]
+    }
+
+    suspend fun measurePing(server: ServerConfig): Long = withContext(Dispatchers.IO) {
+        runCatching {
+            val startedAt = System.nanoTime()
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(server.address, server.port), PING_TIMEOUT_MS)
+            }
+            (System.nanoTime() - startedAt) / 1_000_000L
+        }.getOrDefault(-1L)
     }
 
     suspend fun saveServer(config: ServerConfig) {
@@ -62,6 +76,7 @@ class ServerRepository(context: Context) {
                             port = item.getInt("port"),
                             rawUrl = item.optionalString("rawUrl"),
                             security = item.optionalString("security"),
+                            protocol = item.optionalString("protocol") ?: "VLESS",
                         )
                     }.getOrNull()?.let(::add)
                 }
@@ -78,6 +93,7 @@ class ServerRepository(context: Context) {
                 put("port", config.port)
                 put("rawUrl", config.rawUrl ?: JSONObject.NULL)
                 put("security", config.security ?: JSONObject.NULL)
+                put("protocol", config.protocol)
             })
         }
     }.toString()
@@ -88,5 +104,6 @@ class ServerRepository(context: Context) {
     private companion object {
         val SERVER_LIST_KEY = stringPreferencesKey("server_list")
         val ACTIVE_SERVER_ID_KEY = stringPreferencesKey("active_server_id")
+        const val PING_TIMEOUT_MS = 2_000
     }
 }

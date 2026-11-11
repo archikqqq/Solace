@@ -15,4 +15,5 @@ data class ServerConfig(
     val port: Int,
     val rawUrl: String? = null,
     val security: String? = null,
+    val protocol: String = "VLESS",
 )

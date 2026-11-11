@@ -39,6 +39,8 @@ class V2NoxVpnService : VpnService() {
     private val operationMutex = Mutex()
     private val mutableState = MutableStateFlow(VpnState.DISCONNECTED)
     val state: StateFlow<VpnState> = mutableState.asStateFlow()
+    private val mutableError = MutableStateFlow<String?>(null)
+    val error: StateFlow<String?> = mutableError.asStateFlow()
 
     @Volatile
     private var tunInterface: ParcelFileDescriptor? = null
@@ -55,6 +57,7 @@ class V2NoxVpnService : VpnService() {
         serviceScope.launch {
             operationMutex.withLock {
                 if (mutableState.value == VpnState.CONNECTED) stopVpnInternal()
+                mutableError.value = null
                 mutableState.value = VpnState.CONNECTING
                 startForeground(NOTIFICATION_ID, buildNotification("Подключение…"))
 
@@ -80,6 +83,7 @@ class V2NoxVpnService : VpnService() {
                     tunInterface?.close()
                     tunInterface = null
                     mutableState.value = VpnState.DISCONNECTED
+                    mutableError.value = exception.message ?: "Не удалось запустить VPN"
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
@@ -111,10 +115,99 @@ class V2NoxVpnService : VpnService() {
     }
 
     private fun buildXrayConfig(config: ServerConfig): String {
-        val uuid = runCatching { java.net.URI(config.rawUrl).userInfo }.getOrNull()
-            ?.substringBefore(':')
-            ?.takeIf(String::isNotBlank)
-            ?: error("В VLESS-конфигурации отсутствует UUID")
+        val rawUrl = config.rawUrl ?: error("У профиля отсутствует исходная ссылка")
+        val link = ServerLinkParser.parseRawLink(rawUrl)
+        val query = link.values
+        val scheme = rawUrl.substringBefore("://").lowercase()
+        val outbound = when (scheme) {
+            "vless" -> JSONObject().apply {
+                put("tag", "proxy"); put("protocol", "vless")
+                put("settings", JSONObject().put("vnext", JSONArray().put(JSONObject()
+                    .put("address", link.host).put("port", link.port)
+                    .put("users", JSONArray().put(JSONObject()
+                        .put("id", link.username?.takeIf(String::isNotBlank) ?: error("В VLESS-ссылке отсутствует UUID"))
+                        .put("encryption", query["encryption"] ?: "none")
+                        .apply { query["flow"]?.let { put("flow", it) } })))))
+            }
+            "vmess" -> JSONObject().apply {
+                put("tag", "proxy"); put("protocol", "vmess")
+                put("settings", JSONObject().put("vnext", JSONArray().put(JSONObject()
+                    .put("address", link.host).put("port", link.port)
+                    .put("users", JSONArray().put(JSONObject()
+                        .put("id", query["id"]?.takeIf(String::isNotBlank) ?: error("В VMess-ссылке отсутствует UUID"))
+                        .put("alterId", query["aid"]?.toIntOrNull() ?: 0)
+                        .put("security", query["scy"] ?: "auto"))))))
+            }
+            "trojan" -> JSONObject().apply {
+                put("tag", "proxy"); put("protocol", "trojan")
+                put("settings", JSONObject().put("servers", JSONArray().put(JSONObject()
+                    .put("address", link.host).put("port", link.port)
+                    .put("password", link.username?.takeIf(String::isNotBlank) ?: error("В Trojan-ссылке отсутствует пароль")))))
+            }
+            "ss", "shadowsocks" -> JSONObject().apply {
+                put("tag", "proxy"); put("protocol", "shadowsocks")
+                put("settings", JSONObject().put("servers", JSONArray().put(JSONObject()
+                    .put("address", link.host).put("port", link.port)
+                    .put("method", query["method"] ?: error("В Shadowsocks-ссылке отсутствует метод шифрования"))
+                    .put("password", link.password ?: error("В Shadowsocks-ссылке отсутствует пароль")))))
+            }
+            "wireguard" -> JSONObject().apply {
+                put("tag", "proxy"); put("protocol", "wireguard")
+                put("settings", JSONObject()
+                    .put("secretKey", link.username ?: error("В WireGuard-ссылке отсутствует приватный ключ"))
+                    .put("address", stringArray(query["address"] ?: error("В WireGuard-ссылке отсутствует address")))
+                    .put("peers", JSONArray().put(JSONObject()
+                        .put("publicKey", query["publickey"] ?: query["publicKey"] ?: error("В WireGuard-ссылке отсутствует publicKey"))
+                        .put("endpoint", "${link.host}:${link.port}")
+                        .put("allowedIPs", stringArray(query["allowedips"] ?: query["allowedIPs"] ?: "0.0.0.0/0,::/0"))))
+                    .apply { query["mtu"]?.toIntOrNull()?.let { put("mtu", it) } })
+            }
+            "hysteria2", "hy2" -> JSONObject().apply {
+                put("tag", "proxy"); put("protocol", "hysteria")
+                put("settings", JSONObject().put("version", 2).put("address", link.host).put("port", link.port))
+            }
+            "tuic" -> error("TUIC импортирован, но не поддерживается встроенным Xray Core")
+            else -> error("Протокол ${config.protocol} не поддерживается")
+        }
+        val transport = if (scheme in setOf("hysteria2", "hy2")) "hysteria" else query["type"] ?: query["net"] ?: "tcp"
+        val security = when {
+            scheme == "vmess" && query["tls"]?.lowercase() in setOf("tls", "true") -> "tls"
+            scheme in setOf("trojan", "hysteria2", "hy2", "tuic") -> "tls"
+            else -> query["security"]?.lowercase()
+        }
+        val stream = JSONObject().put("network", transport).put("security", security ?: "none")
+        if (security == "tls") stream.put("tlsSettings", JSONObject().apply {
+            (query["sni"] ?: query["peer"] ?: query["host"])?.takeIf(String::isNotBlank)?.let { put("serverName", it) }
+            query["fp"]?.takeIf(String::isNotBlank)?.let { put("fingerprint", it) }
+            query["alpn"]?.takeIf(String::isNotBlank)?.let { put("alpn", stringArray(it)) }
+            query["allowInsecure"]?.toBooleanStrictOrNull()?.let { put("allowInsecure", it) }
+        })
+        if (security == "reality") stream.put("realitySettings", JSONObject().apply {
+            (query["sni"] ?: query["serverName"])?.let { put("serverName", it) }
+            (query["fp"] ?: query["fingerprint"])?.let { put("fingerprint", it) }
+            (query["pbk"] ?: query["publicKey"])?.let { put("publicKey", it) }
+            (query["sid"] ?: query["shortId"])?.let { put("shortId", it) }
+            (query["spx"] ?: query["spiderX"])?.let { put("spiderX", it) }
+        })
+        if (scheme in setOf("hysteria2", "hy2")) {
+            stream.put("hysteriaSettings", JSONObject().put("version", 2).put("auth", link.username ?: ""))
+            query["obfs-password"]?.let { stream.getJSONObject("hysteriaSettings").put("obfsPassword", it) }
+        }
+        when (transport.lowercase()) {
+            "ws", "websocket" -> stream.put("wsSettings", JSONObject().apply {
+                query["path"]?.let { put("path", it) }
+                (query["host"] ?: query["authority"])?.let { put("headers", JSONObject().put("Host", it)) }
+            })
+            "grpc" -> stream.put("grpcSettings", JSONObject().apply {
+                (query["serviceName"] ?: query["service-name"] ?: query["path"])?.let { put("serviceName", it) }
+                query["authority"]?.let { put("authority", it) }
+            })
+            "http", "h2" -> stream.put("httpSettings", JSONObject().apply {
+                query["path"]?.let { put("path", it) }
+                (query["host"] ?: query["authority"])?.let { put("host", JSONArray().put(it)) }
+            })
+        }
+        outbound.put("streamSettings", stream)
         return JSONObject().apply {
             put("log", JSONObject().put("loglevel", "warning"))
             put("inbounds", JSONArray().put(JSONObject()
@@ -122,17 +215,15 @@ class V2NoxVpnService : VpnService() {
                 .put("port", 0)
                 .put("protocol", "dokodemo-door")
                 .put("settings", JSONObject().put("network", "tcp,udp").put("followRedirect", true))))
-            put("outbounds", JSONArray().put(JSONObject()
-                .put("tag", "proxy")
-                .put("protocol", "vless")
-                .put("settings", JSONObject().put("vnext", JSONArray().put(JSONObject()
-                    .put("address", config.address)
-                    .put("port", config.port)
-                    .put("users", JSONArray().put(JSONObject().put("id", uuid).put("encryption", "none")))))))
+            put("outbounds", JSONArray().put(outbound)
                 .put(JSONObject().put("tag", "direct").put("protocol", "freedom")))
             put("routing", JSONObject().put("rules", JSONArray().put(JSONObject()
                 .put("type", "field").put("inboundTag", JSONArray().put("tun-in")).put("outboundTag", "proxy"))))
         }.toString()
+    }
+
+    private fun stringArray(value: String): JSONArray = JSONArray().apply {
+        value.split(',').map(String::trim).filter(String::isNotBlank).forEach(::put)
     }
 
     override fun onRevoke() {
