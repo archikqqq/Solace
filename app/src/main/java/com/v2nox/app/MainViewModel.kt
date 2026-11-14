@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import java.util.UUID
 
 data class MainUiState(
@@ -29,6 +31,7 @@ data class MainUiState(
     val errorMessage: String? = null,
     val pingResults: Map<String, Long> = emptyMap(),
     val pingingServerId: String? = null,
+    val isPingingAll: Boolean = false,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -112,7 +115,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshPing(config: ServerConfig? = mutableUiState.value.activeConfig) {
         config ?: return
         pingJob?.cancel()
-        mutableUiState.value = mutableUiState.value.copy(pingingServerId = config.id)
+        mutableUiState.value = mutableUiState.value.copy(pingingServerId = config.id, isPingingAll = false)
         pingJob = viewModelScope.launch {
             val result = serverRepository.measurePing(config)
             val current = mutableUiState.value
@@ -121,6 +124,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 pingingServerId = current.pingingServerId.takeUnless { it == config.id },
             )
         }
+    }
+
+    /** Reuses the existing TCP measurement, sequentially; never starts a VPN. */
+    fun refreshAllPings() {
+        val configs = mutableUiState.value.savedConfigs
+        if (configs.isEmpty()) return
+        pingJob?.cancel()
+        mutableUiState.value = mutableUiState.value.copy(isPingingAll = true)
+        pingJob = viewModelScope.launch {
+            try {
+                for (config in configs) {
+                    if (mutableUiState.value.savedConfigs.none { it.id == config.id }) continue
+                    mutableUiState.value = mutableUiState.value.copy(pingingServerId = config.id)
+                    val result = serverRepository.measurePing(config)
+                    val current = mutableUiState.value
+                    if (current.savedConfigs.any { it.id == config.id }) {
+                        mutableUiState.value = current.copy(pingResults = current.pingResults + (config.id to result))
+                    }
+                }
+            } finally {
+                // A cancelled batch must not erase a newer single/batch measurement.
+                if (currentCoroutineContext().isActive) {
+                    mutableUiState.value = mutableUiState.value.copy(isPingingAll = false, pingingServerId = null)
+                }
+            }
+        }
+    }
+
+    fun renameConfig(config: ServerConfig, name: String) {
+        val trimmed = name.trim().takeIf { it.isNotEmpty() } ?: return
+        val current = mutableUiState.value
+        val existing = current.savedConfigs.firstOrNull { it.id == config.id } ?: return
+        val renamed = existing.copy(name = trimmed)
+        mutableUiState.value = current.copy(
+            savedConfigs = current.savedConfigs.map { if (it.id == renamed.id) renamed else it },
+            activeConfig = if (current.activeConfig?.id == renamed.id) renamed else current.activeConfig,
+        )
+        viewModelScope.launch { serverRepository.saveServer(renamed) }
     }
 
     fun deleteConfig(config: ServerConfig) {

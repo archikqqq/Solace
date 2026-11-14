@@ -6,6 +6,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import com.v2nox.app.ui.theme.V2NoxTheme
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
@@ -14,7 +18,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            V2NoxTheme {
+            val appearanceRepository = remember { AppearanceRepository(applicationContext) }
+            val appearance by appearanceRepository.settings.collectAsStateWithLifecycle(initialValue = AppearanceSettings())
+            V2NoxTheme(
+                darkTheme = if (appearance.followSystem) isSystemInDarkTheme() else appearance.darkTheme,
+                dynamicColor = appearance.dynamicColor,
+            ) {
                 MainScreen(viewModel)
             }
         }
