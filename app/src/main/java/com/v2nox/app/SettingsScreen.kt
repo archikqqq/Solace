@@ -1,5 +1,8 @@
 package com.v2nox.app
 
+import android.app.StatusBarManager
+import android.content.ComponentName
+import android.graphics.drawable.Icon
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -12,7 +15,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -23,11 +28,15 @@ import java.io.IOException
 @Composable
 internal fun SettingsScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val repository = remember(context) { AppearanceRepository(context) }
     val settings by repository.settings.collectAsStateWithLifecycle(initialValue = AppearanceSettings())
+    val happEnabled by remember(context) { HappSpoof.enabled(context) }.collectAsStateWithLifecycle(initialValue = true)
     val scope = rememberCoroutineScope()
     val systemDarkTheme = isSystemInDarkTheme()
     var saveError by remember { mutableStateOf(false) }
+    var tileResult by remember { mutableStateOf<String?>(null) }
+    var tileRequestPending by remember { mutableStateOf(false) }
     fun save(operation: suspend () -> Unit) {
         scope.launch {
             try { operation(); saveError = false } catch (_: IOException) { saveError = true }
@@ -62,9 +71,69 @@ internal fun SettingsScreen(modifier: Modifier = Modifier) {
                     Icons.Rounded.Palette, checked = settings.dynamicColor, enabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S,
                     index = 2, count = 3, onCheckedChange = { save { repository.setDynamicColor(it) } })
             }
+            item {
+                Text("ПОДПИСКИ", Modifier.padding(start = 12.dp, top = 28.dp, bottom = 12.dp),
+                    style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            }
+            item {
+                SettingSwitch("Представляться как Happ", "Использовать заголовки Happ при загрузке подписок", Icons.Rounded.Sync,
+                    checked = happEnabled, index = 0, count = 1,
+                    onCheckedChange = { save { HappSpoof.setEnabled(context, it) } })
+            }
             if (saveError) item {
                 Text("Не удалось сохранить настройки. Попробуйте ещё раз.", Modifier.padding(12.dp),
                     color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            }
+            item {
+                Text("УПРАВЛЕНИЕ", Modifier.padding(start = 12.dp, top = 28.dp, bottom = 12.dp),
+                    style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            }
+            item {
+                Surface(shape = groupedShape(0, 1), color = MaterialTheme.colorScheme.surfaceContainerLow) {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 18.dp),
+                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Icon(Icons.Rounded.Dashboard, null, tint = MaterialTheme.colorScheme.primary)
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Плитка быстрого включения", style = MaterialTheme.typography.titleMedium)
+                            Text("Включайте VPN из шторки", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            Button(enabled = !tileRequestPending, onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                tileRequestPending = true
+                                tileResult = null
+                                try {
+                                    context.getSystemService(StatusBarManager::class.java).requestAddTileService(
+                                        ComponentName(context, V2NoxTileService::class.java), "Solace",
+                                        Icon.createWithResource(context, R.drawable.ic_tile_off), context.mainExecutor,
+                                    ) { result ->
+                                        tileRequestPending = false
+                                        tileResult = when (result) {
+                                            StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED -> "Плитка добавлена."
+                                            StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ALREADY_ADDED -> "Плитка уже добавлена."
+                                            StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_NOT_ADDED -> "Добавление плитки отклонено."
+                                            else -> "Не удалось добавить плитку. Попробуйте ещё раз."
+                                        }
+                                    }
+                                } catch (_: RuntimeException) {
+                                    tileRequestPending = false
+                                    tileResult = "Не удалось добавить плитку. Попробуйте ещё раз."
+                                }
+                            }) { Text("Добавить") }
+                        }
+                    }
+                }
+            }
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) item {
+                Text("Потяните шторку вниз → ✎ → перетащите Solace в панель", Modifier.padding(12.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+            }
+            tileResult?.let { result ->
+                item {
+                    Text(result, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium)
+                }
             }
             item {
                 Text("О ПРИЛОЖЕНИИ", Modifier.padding(start = 12.dp, top = 28.dp, bottom = 12.dp),
@@ -75,7 +144,7 @@ internal fun SettingsScreen(modifier: Modifier = Modifier) {
                     Row(Modifier.fillMaxWidth().padding(20.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                         Icon(Icons.Rounded.Shield, null, tint = MaterialTheme.colorScheme.primary)
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("V2Nox", style = MaterialTheme.typography.titleMedium)
+                            Text("Solace", style = MaterialTheme.typography.titleMedium)
                             Text("Inter · Material 3 Expressive", style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text("Настройки оформления не меняют параметры VPN и Xray.", style = MaterialTheme.typography.bodySmall,

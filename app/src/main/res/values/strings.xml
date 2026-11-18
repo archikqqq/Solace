@@ -1,3 +1,14 @@
 <resources>
-    <string name="app_name">v2Nox</string>
+    <string name="app_name">Solace</string>
+    <string name="tile_label">Solace</string>
+    <string name="widget_name">Solace VPN</string>
+    <string name="widget_description">Статус VPN и выбранный сервер Solace</string>
+    <string name="widget_connected">Защищено</string>
+    <string name="widget_disconnected">Отключено</string>
+    <string name="widget_connecting">Подключение…</string>
+    <string name="widget_stopping">Отключение…</string>
+    <string name="widget_no_server">Выберите сервер в Solace</string>
+    <string name="widget_permission_required">Разрешите VPN в Solace перед включением из виджета</string>
+    <string name="widget_turn_on">Включить VPN</string>
+    <string name="widget_turn_off">Выключить VPN</string>
 </resources>

@@ -1,0 +1,10 @@
+<resources>
+    <color name="widget_surface_container_high">#E8E7EC</color>
+    <color name="widget_on_surface">#1B1B20</color>
+    <color name="widget_primary_container">#D4E8D3</color>
+    <color name="widget_on_primary_container">#102314</color>
+    <color name="widget_secondary_container">#DCE5D9</color>
+    <color name="widget_on_secondary_container">#192219</color>
+    <color name="widget_primary">#386A43</color>
+    <color name="widget_on_primary">#FFFFFF</color>
+</resources>

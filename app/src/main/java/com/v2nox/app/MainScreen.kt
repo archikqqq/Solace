@@ -12,6 +12,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
+import android.os.Build
+import android.view.HapticFeedbackConstants
+import android.view.View
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
@@ -20,6 +24,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
+    val view = LocalView.current
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         viewModel.onVpnPermissionResult(context, result.resultCode == android.app.Activity.RESULT_OK)
@@ -39,25 +44,37 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
             when (destination) {
                 MainDestination.Home -> Dashboard(
                     state = state,
-                    onToggle = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); viewModel.toggleVpn(context) },
+                    onToggle = { if (state.vpnState == VpnState.DISCONNECTED) confirmHaptic(view) else contextHaptic(view); viewModel.toggleVpn(context) },
                     onServers = { destination = MainDestination.Servers },
-                    onPing = { viewModel.refreshPing(state.activeConfig) },
+                    onPing = { contextHaptic(view); viewModel.refreshPing(state.activeConfig) },
+                    onQuickSelect = { contextHaptic(view); viewModel.selectConfig(it) },
                     modifier = screenModifier,
                 )
                 MainDestination.Servers -> ProfilesScreen(
                     state = state,
-                    onSelect = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); viewModel.selectConfig(it) },
+                    onSelect = { contextHaptic(view); viewModel.selectConfig(it) },
                     onDelete = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); viewModel.deleteConfig(it) },
                     onRename = viewModel::renameConfig,
                     onPingAll = viewModel::refreshAllPings,
                     onImport = viewModel::importFromClipboard,
+                    onAddSubscription = viewModel::addSubscription,
+                    onRefreshSubscription = viewModel::refreshSubscription,
+                    onDeleteSubscription = viewModel::deleteSubscription,
                     modifier = screenModifier,
                 )
                 MainDestination.Settings -> SettingsScreen(modifier = screenModifier)
             }
         }
-        FloatingNavigationDock(destination, onSelect = { destination = it }, modifier = Modifier.align(Alignment.BottomCenter))
+        FloatingNavigationDock(destination, onSelect = { contextHaptic(view); destination = it }, modifier = Modifier.align(Alignment.BottomCenter))
     }
 }
 
 internal val FloatingDockContentPadding = 112.dp
+
+private fun confirmHaptic(view: View) {
+    view.performHapticFeedback(if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.CONFIRM else HapticFeedbackConstants.CONTEXT_CLICK)
+}
+
+private fun contextHaptic(view: View) {
+    view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+}

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:paddingHorizontal="12dp"
+    android:paddingVertical="4dp"
+    android:background="@drawable/widget_container">
+    <ImageView
+        android:id="@+id/widget_logo"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
+        android:layout_marginEnd="8dp"
+        android:src="@drawable/solace_icon"
+        android:tint="@color/widget_on_surface"
+        android:contentDescription="@string/app_name" />
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+        <TextView
+            android:id="@+id/widget_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/widget_disconnected"
+            android:textColor="@color/widget_on_surface"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:maxLines="1"
+            android:ellipsize="end" />
+        <TextView
+            android:id="@+id/widget_server"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/widget_no_server"
+            android:textColor="@color/widget_on_surface"
+            android:textSize="12sp"
+            android:maxLines="1"
+            android:ellipsize="end" />
+    </LinearLayout>
+    <ImageButton
+        android:id="@+id/widget_power"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_marginStart="8dp"
+        android:padding="12dp"
+        android:background="@drawable/widget_power"
+        android:src="@drawable/ic_widget_power"
+        android:tint="@color/widget_on_primary_container"
+        android:contentDescription="@string/widget_turn_on" />
+</LinearLayout>

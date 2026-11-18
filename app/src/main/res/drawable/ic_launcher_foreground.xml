@@ -4,17 +4,11 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Two rounded links form a V, entirely inside the central 66dp safe zone. -->
     <path
         android:fillColor="@android:color/transparent"
-        android:pathData="M35,38 L54,71"
-        android:strokeColor="#A995E5"
+        android:pathData="M54,30 L73,37 V52 C73,63 66,73 54,78 C42,73 35,63 35,52 V37 Z M45,47 L54,60 L63,47"
+        android:strokeColor="@color/ic_launcher_foreground"
         android:strokeLineCap="round"
-        android:strokeWidth="14" />
-    <path
-        android:fillColor="@android:color/transparent"
-        android:pathData="M54,71 L73,38"
-        android:strokeColor="#E9DDFF"
-        android:strokeLineCap="round"
-        android:strokeWidth="14" />
+        android:strokeLineJoin="round"
+        android:strokeWidth="5" />
 </vector>

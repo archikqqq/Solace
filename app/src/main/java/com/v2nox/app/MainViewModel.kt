@@ -17,8 +17,10 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
@@ -28,6 +30,8 @@ data class MainUiState(
     val vpnState: VpnState = VpnState.DISCONNECTED,
     val activeConfig: ServerConfig? = null,
     val savedConfigs: List<ServerConfig> = emptyList(),
+    val subscriptions: List<SubscriptionConfig> = emptyList(),
+    val refreshingSubscriptionId: String? = null,
     val errorMessage: String? = null,
     val pingResults: Map<String, Long> = emptyMap(),
     val pingingServerId: String? = null,
@@ -38,6 +42,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val mutableUiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = mutableUiState.asStateFlow()
     private val serverRepository = ServerRepository(application)
+    private val subscriptionRepository = SubscriptionRepository(application)
 
     private val mutablePermissionRequests = MutableSharedFlow<Intent>(extraBufferCapacity = 1)
     val permissionRequests: SharedFlow<Intent> = mutablePermissionRequests.asSharedFlow()
@@ -49,6 +54,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var lastPingTarget: Triple<String, String, Int>? = null
 
     init {
+        viewModelScope.launch {
+            subscriptionRepository.subscriptions
+                .catch { mutableUiState.value = mutableUiState.value.copy(errorMessage = "Не удалось загрузить подписки") }
+                .collect { subscriptions ->
+                    mutableUiState.value = mutableUiState.value.copy(subscriptions = subscriptions)
+                }
+        }
         viewModelScope.launch {
             combine(serverRepository.servers, serverRepository.activeServerId) { configs, activeId ->
                 configs to activeId
@@ -85,20 +97,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun importFromClipboard(text: String) {
-        runCatching { ServerLinkParser.parse(text) }
+        runCatching { parseProfileImport(text) }
             .onSuccess { parsed ->
                 val existing = mutableUiState.value.savedConfigs
-                if (existing.none { it.rawUrl == parsed.rawUrl }) {
+                val identities = existing.map { it.identityKey }.toMutableSet()
+                val added = parsed.filter { identities.add(it.identityKey) }
+                if (added.isNotEmpty()) {
                     val shouldActivate = mutableUiState.value.activeConfig == null
                     mutableUiState.value = mutableUiState.value.copy(
-                        savedConfigs = existing + parsed,
-                        activeConfig = mutableUiState.value.activeConfig ?: parsed,
+                        savedConfigs = existing + added,
+                        activeConfig = mutableUiState.value.activeConfig ?: added.first(),
                         errorMessage = null,
                     )
                     viewModelScope.launch {
-                        serverRepository.saveServer(parsed)
+                        added.forEach { serverRepository.saveServer(it) }
                         if (shouldActivate && serverRepository.activeServerId.first() == null) {
-                            serverRepository.setActiveServerId(parsed.id)
+                            serverRepository.setActiveServerId(added.first().id)
                         }
                     }
                 }
@@ -106,10 +120,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .onFailure { mutableUiState.value = mutableUiState.value.copy(errorMessage = it.message ?: "Не удалось прочитать конфигурацию") }
     }
 
+    fun addSubscription(url: String) {
+        viewModelScope.launch {
+            try {
+                mutableUiState.value = mutableUiState.value.copy(errorMessage = null)
+                val subscription = subscriptionRepository.add(url).getOrThrow()
+                if (serverRepository.activeServerId.first() == null) {
+                    serverRepository.servers.first().firstOrNull { it.subscriptionId == subscription.id }?.let {
+                        serverRepository.setActiveServerId(it.id)
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                mutableUiState.value = mutableUiState.value.copy(
+                    errorMessage = e.message ?: "Не удалось добавить подписку",
+                )
+            }
+        }
+    }
+
+    fun refreshSubscription(id: String) {
+        if (mutableUiState.value.refreshingSubscriptionId != null) return
+        mutableUiState.value = mutableUiState.value.copy(refreshingSubscriptionId = id, errorMessage = null)
+        viewModelScope.launch {
+            try {
+                subscriptionRepository.update(id).getOrThrow()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                mutableUiState.value = mutableUiState.value.copy(
+                    errorMessage = e.message ?: "Не удалось обновить подписку",
+                )
+            } finally {
+                mutableUiState.value = mutableUiState.value.copy(refreshingSubscriptionId = null)
+            }
+        }
+    }
+
+    fun deleteSubscription(id: String) {
+        viewModelScope.launch {
+            try {
+                subscriptionRepository.remove(id)
+                mutableUiState.value = mutableUiState.value.copy(errorMessage = null)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                mutableUiState.value = mutableUiState.value.copy(errorMessage = "Не удалось удалить подписку. Попробуйте ещё раз.")
+            }
+        }
+    }
+
     fun selectConfig(config: ServerConfig) {
-        mutableUiState.value = mutableUiState.value.copy(activeConfig = config, errorMessage = null)
-        refreshPing(config)
-        viewModelScope.launch { serverRepository.setActiveServerId(config.id) }
+        val selected = mutableUiState.value.savedConfigs.firstOrNull { it.identityKey == config.identityKey } ?: return
+        mutableUiState.value = mutableUiState.value.copy(activeConfig = selected, errorMessage = null)
+        refreshPing(selected)
+        viewModelScope.launch { serverRepository.setActiveServerId(selected.id) }
     }
 
     fun refreshPing(config: ServerConfig? = mutableUiState.value.activeConfig) {
@@ -259,7 +322,7 @@ object ServerLinkParser {
     }
 
     private fun parseUri(link: String): LinkParts {
-        val uri = java.net.URI(link)
+        val uri = java.net.URI(LinkUtils.fixIllegalUrl(link))
         val values = decodeQuery(uri.rawQuery)
         val userInfo = uri.rawUserInfo?.let(::decode)
         return LinkParts(
@@ -294,7 +357,8 @@ object ServerLinkParser {
     }
 
     private fun parseShadowsocks(link: String): LinkParts {
-        val body = link.substringAfter("://").substringBefore('#')
+        val sanitized = LinkUtils.fixIllegalUrl(link)
+        val body = sanitized.substringAfter("://").substringBefore('#')
         val userAt = body.lastIndexOf('@')
         val userInfo: String
         val server: String
@@ -311,8 +375,8 @@ object ServerLinkParser {
         val credentials = runCatching { decodeBase64(userInfo) }.getOrDefault(decode(userInfo))
         val colon = credentials.indexOf(':')
         require(colon > 0) { "Некорректные параметры Shadowsocks" }
-        val uri = java.net.URI("ss://$server")
-        val fragment = link.substringAfter('#', "").takeIf(String::isNotBlank)?.let(::decode)
+        val uri = java.net.URI(LinkUtils.fixIllegalUrl("ss://$server"))
+        val fragment = sanitized.substringAfter('#', "").takeIf(String::isNotBlank)?.let(::decode)
         return LinkParts(
             host = uri.host ?: error("В конфигурации отсутствует адрес сервера"),
             port = uri.port,
@@ -335,7 +399,7 @@ object ServerLinkParser {
     private fun decodeBase64(value: String): String {
         val normalized = value.replace('-', '+').replace('_', '/')
         val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
-        return String(android.util.Base64.decode(padded, android.util.Base64.DEFAULT), Charsets.UTF_8)
+        return String(java.util.Base64.getDecoder().decode(padded), Charsets.UTF_8)
     }
 }
 

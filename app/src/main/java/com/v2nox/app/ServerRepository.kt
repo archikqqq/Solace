@@ -10,8 +10,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.InetSocketAddress
-import java.net.Socket
 
 private val Context.serverPreferences by preferencesDataStore(name = "servers")
 
@@ -27,13 +25,7 @@ class ServerRepository(context: Context) {
     }
 
     suspend fun measurePing(server: ServerConfig): Long = withContext(Dispatchers.IO) {
-        runCatching {
-            val startedAt = System.nanoTime()
-            Socket().use { socket ->
-                socket.connect(InetSocketAddress(server.address, server.port), PING_TIMEOUT_MS)
-            }
-            (System.nanoTime() - startedAt) / 1_000_000L
-        }.getOrDefault(-1L)
+        ActiveProxyLatency.measure(server.id)
     }
 
     suspend fun saveServer(config: ServerConfig) {
@@ -51,6 +43,32 @@ class ServerRepository(context: Context) {
             val updated = decodeServers(preferences[SERVER_LIST_KEY].orEmpty()).filterNot { it.id == id }
             preferences[SERVER_LIST_KEY] = encodeServers(updated)
         }
+    }
+
+    suspend fun replaceSubscriptionServers(subscriptionId: String, newServers: List<ServerConfig>) {
+        dataStore.edit { preferences ->
+            val current = decodeServers(preferences[SERVER_LIST_KEY].orEmpty())
+            val previous = current.filter { it.subscriptionId == subscriptionId }
+            val previousByIdentity = previous.groupBy { it.identityKey }
+                .mapValues { (_, servers) -> servers.toMutableList() }
+            val replacements = newServers.map { server ->
+                val oldServer = previousByIdentity[server.identityKey]?.removeFirstOrNull()
+                server.copy(id = oldServer?.id ?: server.id, subscriptionId = subscriptionId)
+            }
+            val updated = current.filterNot { it.subscriptionId == subscriptionId } + replacements
+            preferences[SERVER_LIST_KEY] = encodeServers(updated)
+
+            val activeId = preferences[ACTIVE_SERVER_ID_KEY]
+            if (previous.any { it.id == activeId } && replacements.none { it.id == activeId }) {
+                val nextActiveId = replacements.firstOrNull()?.id
+                if (nextActiveId == null) preferences.remove(ACTIVE_SERVER_ID_KEY)
+                else preferences[ACTIVE_SERVER_ID_KEY] = nextActiveId
+            }
+        }
+    }
+
+    suspend fun removeSubscriptionServers(subscriptionId: String) {
+        replaceSubscriptionServers(subscriptionId, emptyList())
     }
 
     suspend fun setActiveServerId(id: String?) {
@@ -77,6 +95,9 @@ class ServerRepository(context: Context) {
                             rawUrl = item.optionalString("rawUrl"),
                             security = item.optionalString("security"),
                             protocol = item.optionalString("protocol") ?: "VLESS",
+                            subscriptionId = item.optionalString("subscriptionId"),
+                            outboundJson = item.optionalString("outboundJson"),
+                            fullConfigJson = item.optionalString("fullConfigJson"),
                         )
                     }.getOrNull()?.let(::add)
                 }
@@ -94,6 +115,9 @@ class ServerRepository(context: Context) {
                 put("rawUrl", config.rawUrl ?: JSONObject.NULL)
                 put("security", config.security ?: JSONObject.NULL)
                 put("protocol", config.protocol)
+                put("subscriptionId", config.subscriptionId ?: JSONObject.NULL)
+                put("outboundJson", config.outboundJson ?: JSONObject.NULL)
+                put("fullConfigJson", config.fullConfigJson ?: JSONObject.NULL)
             })
         }
     }.toString()
@@ -104,6 +128,5 @@ class ServerRepository(context: Context) {
     private companion object {
         val SERVER_LIST_KEY = stringPreferencesKey("server_list")
         val ACTIVE_SERVER_ID_KEY = stringPreferencesKey("active_server_id")
-        const val PING_TIMEOUT_MS = 2_000
     }
 }

@@ -9,43 +9,92 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
+import hev.htproxy.TProxyService
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import libv2ray.CoreCallbackHandler
 import libv2ray.CoreController
 import libv2ray.Libv2ray
-import org.json.JSONArray
-import org.json.JSONObject
+import java.io.File
 
 class V2NoxVpnService : VpnService() {
     inner class LocalBinder : android.os.Binder() { val service: V2NoxVpnService get() = this@V2NoxVpnService }
     private val localBinder = LocalBinder()
 
-    override fun onBind(intent: Intent): android.os.IBinder = localBinder
+    override fun onBind(intent: Intent): android.os.IBinder? =
+        if (intent.action == SERVICE_INTERFACE) super.onBind(intent) else localBinder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_WIDGET_TOGGLE) {
+            when (state.value) {
+                VpnState.CONNECTED, VpnState.CONNECTING -> stopVpn()
+                VpnState.STOPPING -> Unit
+                VpnState.DISCONNECTED -> {
+                    if (VpnService.prepare(this) != null) {
+                        startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.widget_permission_required)))
+                        android.widget.Toast.makeText(this, R.string.widget_permission_required, android.widget.Toast.LENGTH_LONG).show()
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf(startId)
+                    } else {
+                        return onStartCommand(Intent(this, V2NoxVpnService::class.java).setAction(ACTION_START), flags, startId)
+                    }
+                }
+            }
+            return START_NOT_STICKY
+        }
         if (intent?.action == ACTION_STOP) stopVpn()
+        if (intent?.action == ACTION_START) {
+            startForeground(NOTIFICATION_ID, buildNotification("Подключение…"))
+            serviceScope.launch {
+                operationMutex.withLock {
+                    if (destroyed) return@withLock
+                    try {
+                        val repository = ServerRepository(applicationContext)
+                        val servers = repository.servers.first()
+                        val activeServerId = repository.activeServerId.first()
+                        val config = servers.firstOrNull { it.id == activeServerId }
+                            ?: run {
+                                android.os.Handler(mainLooper).post {
+                                    android.widget.Toast.makeText(this@V2NoxVpnService, R.string.widget_no_server, android.widget.Toast.LENGTH_LONG).show()
+                                }
+                                error("Сначала выберите сервер")
+                            }
+                        startVpnInternal(config)
+                    } catch (exception: Exception) {
+                        if (exception is CancellationException) throw exception
+                        failVpn(exception.message ?: "Не удалось загрузить активный сервер")
+                    }
+                }
+            }
+        }
         return START_NOT_STICKY
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val operationMutex = Mutex()
-    private val mutableState = MutableStateFlow(VpnState.DISCONNECTED)
-    val state: StateFlow<VpnState> = mutableState.asStateFlow()
+    val state: StateFlow<VpnState> = VpnStateHolder.state
     private val mutableError = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = mutableError.asStateFlow()
 
     @Volatile
+    private var destroyed = false
     private var tunInterface: ParcelFileDescriptor? = null
-    @Volatile
     private var coreController: CoreController? = null
+    private var bridgeConfig: File? = null
+    private var geoAssets: File? = null
+    private var bridgeStarted = false
+    private var bridgeMonitor: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -56,36 +105,69 @@ class V2NoxVpnService : VpnService() {
     fun startVpn(config: ServerConfig) {
         serviceScope.launch {
             operationMutex.withLock {
-                if (mutableState.value == VpnState.CONNECTED) stopVpnInternal()
-                mutableError.value = null
-                mutableState.value = VpnState.CONNECTING
-                startForeground(NOTIFICATION_ID, buildNotification("Подключение…"))
+                if (!destroyed) startVpnInternal(config)
+            }
+        }
+    }
 
-                try {
-                    Libv2ray.initCoreEnv(filesDir.absolutePath, cacheDir.absolutePath)
-                    val established = Builder()
-                        .setSession(config.name)
-                        .setMtu(1500)
-                        .addAddress("10.0.0.2", 32)
-                        .addRoute("0.0.0.0", 0)
-                        .establish() ?: error("Не удалось создать VPN-интерфейс")
+    private fun startVpnInternal(config: ServerConfig) {
+        releaseTunnel()
+        mutableError.value = null
+        VpnStateHolder.mutableState.value = VpnState.CONNECTING
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Подключение…"))
+            val session = VpnTunnelConfig.create(config)
+            val xray = session.xrayConfig(config)
+            geoAssets = XrayGeoAssets.prepare(this, xray)
+            Libv2ray.initCoreEnv((geoAssets ?: filesDir).absolutePath, "")
+            val controller = Libv2ray.newCoreController(coreCallbacks)
+            coreController = controller
+            controller.startLoop(xray, 0) // HEV, not Xray, owns TUN I/O.
+            session.socks.verify()
 
-                    tunInterface = established
-                    val controller = Libv2ray.newCoreController(null)
-                    controller.startLoop(buildXrayConfig(config), established.fd)
-                    coreController = controller
+            val yaml = File.createTempFile("hev-session-", ".yml", cacheDir)
+            bridgeConfig = yaml
+            yaml.writeText(session.hevConfig())
 
-                    mutableState.value = VpnState.CONNECTED
-                    updateNotification("Подключено: ${config.name}")
-                } catch (exception: Exception) {
-                    runCatching { coreController?.stopLoop() }
-                    coreController = null
-                    tunInterface?.close()
-                    tunInterface = null
-                    mutableState.value = VpnState.DISCONNECTED
-                    mutableError.value = exception.message ?: "Не удалось запустить VPN"
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+            val established = Builder()
+                .setSession(config.name)
+                .setMtu(VpnTunnelConfig.MTU)
+                .addAddress(VpnTunnelConfig.TUN_IPV4, 32)
+                .addAddress(VpnTunnelConfig.TUN_IPV6, 128)
+                .addRoute("0.0.0.0", 0)
+                .addRoute("::", 0)
+                .addDnsServer(VpnTunnelConfig.DNS_IPV4)
+                // Native Xray sockets and its upstream DNS must not loop back into TUN.
+                .addDisallowedApplication(packageName)
+                .establish() ?: error("Не удалось создать VPN-интерфейс")
+            tunInterface = established
+            check(TProxyService.TProxyStartService(yaml.absolutePath, established.fd)) {
+                "Не удалось запустить tun2socks"
+            }
+            bridgeStarted = true
+            check(TProxyService.TProxyIsRunning()) { "Мост tun2socks завершился при запуске" }
+
+            ActiveProxyLatency.start(config.id, session.socks)
+            VpnStateHolder.mutableState.value = VpnState.CONNECTED
+            updateNotification("Подключено: ${config.name}")
+            monitorBridge()
+        } catch (exception: Exception) {
+            failVpn(exception.message ?: "Не удалось запустить VPN")
+        } catch (_: LinkageError) {
+            failVpn("Не удалось загрузить нативную библиотеку VPN")
+        }
+    }
+
+    private fun monitorBridge() {
+        bridgeMonitor = serviceScope.launch {
+            while (true) {
+                delay(1_000)
+                operationMutex.withLock {
+                    if (destroyed) return@launch
+                    if (!TProxyService.TProxyIsRunning()) {
+                        failVpn("Мост tun2socks остановился")
+                        return@launch
+                    }
                 }
             }
         }
@@ -94,149 +176,59 @@ class V2NoxVpnService : VpnService() {
     /** Safe to call from UI code. */
     fun stopVpn() {
         serviceScope.launch {
-            operationMutex.withLock { stopVpnInternal() }
+            operationMutex.withLock {
+                if (!destroyed) stopVpnInternal()
+            }
         }
     }
 
-    private fun stopVpnInternal() {
-        if (mutableState.value == VpnState.DISCONNECTED) {
-            stopSelf()
-            return
-        }
-        mutableState.value = VpnState.STOPPING
+    private fun failVpn(message: String) {
+        mutableError.value = message
+        stopVpnInternal()
+    }
 
-        runCatching { coreController?.stopLoop() }
-        coreController = null
-        runCatching { tunInterface?.close() }
-        tunInterface = null
-        mutableState.value = VpnState.DISCONNECTED
+    private fun stopVpnInternal() {
+        if (VpnStateHolder.mutableState.value != VpnState.DISCONNECTED) {
+            VpnStateHolder.mutableState.value = VpnState.STOPPING
+        }
+        releaseTunnel()
+        VpnStateHolder.mutableState.value = VpnState.DISCONNECTED
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    private fun buildXrayConfig(config: ServerConfig): String {
-        val rawUrl = config.rawUrl ?: error("У профиля отсутствует исходная ссылка")
-        val link = ServerLinkParser.parseRawLink(rawUrl)
-        val query = link.values
-        val scheme = rawUrl.substringBefore("://").lowercase()
-        val outbound = when (scheme) {
-            "vless" -> JSONObject().apply {
-                put("tag", "proxy"); put("protocol", "vless")
-                put("settings", JSONObject().put("vnext", JSONArray().put(JSONObject()
-                    .put("address", link.host).put("port", link.port)
-                    .put("users", JSONArray().put(JSONObject()
-                        .put("id", link.username?.takeIf(String::isNotBlank) ?: error("В VLESS-ссылке отсутствует UUID"))
-                        .put("encryption", query["encryption"] ?: "none")
-                        .apply { query["flow"]?.let { put("flow", it) } })))))
-            }
-            "vmess" -> JSONObject().apply {
-                put("tag", "proxy"); put("protocol", "vmess")
-                put("settings", JSONObject().put("vnext", JSONArray().put(JSONObject()
-                    .put("address", link.host).put("port", link.port)
-                    .put("users", JSONArray().put(JSONObject()
-                        .put("id", query["id"]?.takeIf(String::isNotBlank) ?: error("В VMess-ссылке отсутствует UUID"))
-                        .put("alterId", query["aid"]?.toIntOrNull() ?: 0)
-                        .put("security", query["scy"] ?: "auto"))))))
-            }
-            "trojan" -> JSONObject().apply {
-                put("tag", "proxy"); put("protocol", "trojan")
-                put("settings", JSONObject().put("servers", JSONArray().put(JSONObject()
-                    .put("address", link.host).put("port", link.port)
-                    .put("password", link.username?.takeIf(String::isNotBlank) ?: error("В Trojan-ссылке отсутствует пароль")))))
-            }
-            "ss", "shadowsocks" -> JSONObject().apply {
-                put("tag", "proxy"); put("protocol", "shadowsocks")
-                put("settings", JSONObject().put("servers", JSONArray().put(JSONObject()
-                    .put("address", link.host).put("port", link.port)
-                    .put("method", query["method"] ?: error("В Shadowsocks-ссылке отсутствует метод шифрования"))
-                    .put("password", link.password ?: error("В Shadowsocks-ссылке отсутствует пароль")))))
-            }
-            "wireguard" -> JSONObject().apply {
-                put("tag", "proxy"); put("protocol", "wireguard")
-                put("settings", JSONObject()
-                    .put("secretKey", link.username ?: error("В WireGuard-ссылке отсутствует приватный ключ"))
-                    .put("address", stringArray(query["address"] ?: error("В WireGuard-ссылке отсутствует address")))
-                    .put("peers", JSONArray().put(JSONObject()
-                        .put("publicKey", query["publickey"] ?: query["publicKey"] ?: error("В WireGuard-ссылке отсутствует publicKey"))
-                        .put("endpoint", "${link.host}:${link.port}")
-                        .put("allowedIPs", stringArray(query["allowedips"] ?: query["allowedIPs"] ?: "0.0.0.0/0,::/0"))))
-                    .apply { query["mtu"]?.toIntOrNull()?.let { put("mtu", it) } })
-            }
-            "hysteria2", "hy2" -> JSONObject().apply {
-                put("tag", "proxy"); put("protocol", "hysteria")
-                put("settings", JSONObject().put("version", 2).put("address", link.host).put("port", link.port))
-            }
-            "tuic" -> error("TUIC импортирован, но не поддерживается встроенным Xray Core")
-            else -> error("Протокол ${config.protocol} не поддерживается")
-        }
-        val transport = if (scheme in setOf("hysteria2", "hy2")) "hysteria" else query["type"] ?: query["net"] ?: "tcp"
-        val security = when {
-            scheme == "vmess" && query["tls"]?.lowercase() in setOf("tls", "true") -> "tls"
-            scheme in setOf("trojan", "hysteria2", "hy2", "tuic") -> "tls"
-            else -> query["security"]?.lowercase()
-        }
-        val stream = JSONObject().put("network", transport).put("security", security ?: "none")
-        if (security == "tls") stream.put("tlsSettings", JSONObject().apply {
-            (query["sni"] ?: query["peer"] ?: query["host"])?.takeIf(String::isNotBlank)?.let { put("serverName", it) }
-            query["fp"]?.takeIf(String::isNotBlank)?.let { put("fingerprint", it) }
-            query["alpn"]?.takeIf(String::isNotBlank)?.let { put("alpn", stringArray(it)) }
-            query["allowInsecure"]?.toBooleanStrictOrNull()?.let { put("allowInsecure", it) }
-        })
-        if (security == "reality") stream.put("realitySettings", JSONObject().apply {
-            (query["sni"] ?: query["serverName"])?.let { put("serverName", it) }
-            (query["fp"] ?: query["fingerprint"])?.let { put("fingerprint", it) }
-            (query["pbk"] ?: query["publicKey"])?.let { put("publicKey", it) }
-            (query["sid"] ?: query["shortId"])?.let { put("shortId", it) }
-            (query["spx"] ?: query["spiderX"])?.let { put("spiderX", it) }
-        })
-        if (scheme in setOf("hysteria2", "hy2")) {
-            stream.put("hysteriaSettings", JSONObject().put("version", 2).put("auth", link.username ?: ""))
-            query["obfs-password"]?.let { stream.getJSONObject("hysteriaSettings").put("obfsPassword", it) }
-        }
-        when (transport.lowercase()) {
-            "ws", "websocket" -> stream.put("wsSettings", JSONObject().apply {
-                query["path"]?.let { put("path", it) }
-                (query["host"] ?: query["authority"])?.let { put("headers", JSONObject().put("Host", it)) }
-            })
-            "grpc" -> stream.put("grpcSettings", JSONObject().apply {
-                (query["serviceName"] ?: query["service-name"] ?: query["path"])?.let { put("serviceName", it) }
-                query["authority"]?.let { put("authority", it) }
-            })
-            "http", "h2" -> stream.put("httpSettings", JSONObject().apply {
-                query["path"]?.let { put("path", it) }
-                (query["host"] ?: query["authority"])?.let { put("host", JSONArray().put(it)) }
-            })
-        }
-        outbound.put("streamSettings", stream)
-        return JSONObject().apply {
-            put("log", JSONObject().put("loglevel", "warning"))
-            put("inbounds", JSONArray().put(JSONObject()
-                .put("tag", "tun-in")
-                .put("port", 0)
-                .put("protocol", "dokodemo-door")
-                .put("settings", JSONObject().put("network", "tcp,udp").put("followRedirect", true))))
-            put("outbounds", JSONArray().put(outbound)
-                .put(JSONObject().put("tag", "direct").put("protocol", "freedom")))
-            put("routing", JSONObject().put("rules", JSONArray().put(JSONObject()
-                .put("type", "field").put("inboundTag", JSONArray().put("tun-in")).put("outboundTag", "proxy"))))
-        }.toString()
-    }
-
-    private fun stringArray(value: String): JSONArray = JSONArray().apply {
-        value.split(',').map(String::trim).filter(String::isNotBlank).forEach(::put)
+    private fun releaseTunnel() {
+        ActiveProxyLatency.stop()
+        bridgeMonitor?.cancel()
+        bridgeMonitor = null
+        // HEV borrows the descriptor; join its worker before closing the descriptor.
+        if (bridgeStarted) runCatching { TProxyService.TProxyStopService() }
+        bridgeStarted = false
+        runCatching { tunInterface?.close() }
+        tunInterface = null
+        runCatching { coreController?.stopLoop() }
+        coreController = null
+        geoAssets?.deleteRecursively()
+        geoAssets = null
+        runCatching { bridgeConfig?.delete() }
+        bridgeConfig = null
     }
 
     override fun onRevoke() {
         stopVpn()
-        super.onRevoke()
     }
 
     override fun onDestroy() {
-        runCatching { coreController?.stopLoop() }
-        coreController = null
-        runCatching { tunInterface?.close() }
-        tunInterface = null
-        serviceScope.cancel()
+        destroyed = true
+        serviceScope.launch {
+            operationMutex.withLock {
+                if (coreController != null) {
+                    releaseTunnel()
+                    VpnStateHolder.mutableState.value = VpnState.DISCONNECTED
+                }
+            }
+            serviceScope.cancel()
+        }
         super.onDestroy()
     }
 
@@ -244,7 +236,7 @@ class V2NoxVpnService : VpnService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "v2Nox VPN",
+                "Solace VPN",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply { description = "Состояние VPN-подключения" }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -263,7 +255,7 @@ class V2NoxVpnService : VpnService() {
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(applicationInfo.icon)
-            .setContentTitle("v2Nox")
+            .setContentTitle("Solace")
             .setContentText(status)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -277,8 +269,17 @@ class V2NoxVpnService : VpnService() {
     }
 
     companion object {
+        // The Xray environment and the HEV worker are process-wide.
+        private val operationMutex = Mutex()
+        private val coreCallbacks = object : CoreCallbackHandler {
+            override fun startup() = 0L
+            override fun shutdown() = 0L
+            override fun onEmitStatus(code: Long, message: String?) = 0L
+        }
         const val CHANNEL_ID = "v2nox_vpn"
+        const val ACTION_START = "com.v2nox.app.action.START_VPN"
         const val ACTION_STOP = "com.v2nox.app.action.STOP_VPN"
+        const val ACTION_WIDGET_TOGGLE = "com.v2nox.app.action.WIDGET_TOGGLE_VPN"
         private const val NOTIFICATION_ID = 2101
     }
 }

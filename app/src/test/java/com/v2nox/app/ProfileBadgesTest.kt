@@ -26,4 +26,13 @@ class ProfileBadgesTest {
     @Test fun noneIsNotShownAsSecurityBadge() {
         assertEquals(listOf("TCP"), profileBadges(config("vless://id@example.com:443?type=tcp&security=none")))
     }
+
+    @Test fun jsonMetadataDoesNotNeedAShareLink() {
+        val server = config().copy(outboundJson = """{"outbound":{"streamSettings":{"network":"xhttp","security":"reality"}}}""")
+        assertEquals(listOf("XHTTP", "REALITY"), profileBadges(server))
+    }
+
+    @Test fun malformedJsonDoesNotCrashCard() {
+        assertEquals(listOf("TLS"), profileBadges(config(security = "tls").copy(outboundJson = "broken")))
+    }
 }
