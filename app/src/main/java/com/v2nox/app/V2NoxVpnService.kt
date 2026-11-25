@@ -71,7 +71,8 @@ class V2NoxVpnService : VpnService() {
                                 }
                                 error("Сначала выберите сервер")
                             }
-                        startVpnInternal(config)
+                        val routeRussiaDirect = AppearanceRepository(applicationContext).settings.first().routeRussiaDirect
+                        startVpnInternal(config, routeRussiaDirect)
                     } catch (exception: Exception) {
                         if (exception is CancellationException) throw exception
                         failVpn(exception.message ?: "Не удалось загрузить активный сервер")
@@ -105,19 +106,22 @@ class V2NoxVpnService : VpnService() {
     fun startVpn(config: ServerConfig) {
         serviceScope.launch {
             operationMutex.withLock {
-                if (!destroyed) startVpnInternal(config)
+                if (!destroyed) {
+                    val routeRussiaDirect = AppearanceRepository(applicationContext).settings.first().routeRussiaDirect
+                    startVpnInternal(config, routeRussiaDirect)
+                }
             }
         }
     }
 
-    private fun startVpnInternal(config: ServerConfig) {
+    private fun startVpnInternal(config: ServerConfig, routeRussiaDirect: Boolean) {
         releaseTunnel()
         mutableError.value = null
         VpnStateHolder.mutableState.value = VpnState.CONNECTING
         try {
             startForeground(NOTIFICATION_ID, buildNotification("Подключение…"))
             val session = VpnTunnelConfig.create(config)
-            val xray = session.xrayConfig(config)
+            val xray = session.xrayConfig(config, this, routeRussiaDirect)
             geoAssets = XrayGeoAssets.prepare(this, xray)
             Libv2ray.initCoreEnv((geoAssets ?: filesDir).absolutePath, "")
             val controller = Libv2ray.newCoreController(coreCallbacks)

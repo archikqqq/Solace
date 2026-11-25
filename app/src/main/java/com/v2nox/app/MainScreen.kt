@@ -45,7 +45,7 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
                 MainDestination.Home -> Dashboard(
                     state = state,
                     onToggle = { if (state.vpnState == VpnState.DISCONNECTED) confirmHaptic(view) else contextHaptic(view); viewModel.toggleVpn(context) },
-                    onServers = { destination = MainDestination.Servers },
+                    onServers = { tabHaptic(view); destination = MainDestination.Servers },
                     onPing = { contextHaptic(view); viewModel.refreshPing(state.activeConfig) },
                     onQuickSelect = { contextHaptic(view); viewModel.selectConfig(it) },
                     modifier = screenModifier,
@@ -65,7 +65,11 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
                 MainDestination.Settings -> SettingsScreen(modifier = screenModifier)
             }
         }
-        FloatingNavigationDock(destination, onSelect = { contextHaptic(view); destination = it }, modifier = Modifier.align(Alignment.BottomCenter))
+        FloatingNavigationDock(
+            selected = destination,
+            onSelect = { if (it != destination) { tabHaptic(view); destination = it } },
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
     }
 }
 
@@ -77,4 +81,11 @@ private fun confirmHaptic(view: View) {
 
 private fun contextHaptic(view: View) {
     view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+}
+
+/** Tab switch feedback: SEGMENT_TICK (API 30+) matches the segmented-control feel; falls back to CONTEXT_CLICK. */
+private fun tabHaptic(view: View) {
+    view.performHapticFeedback(
+        if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.SEGMENT_TICK else HapticFeedbackConstants.CONTEXT_CLICK
+    )
 }

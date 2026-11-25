@@ -2,11 +2,9 @@ package com.v2nox.app
 
 import android.content.ClipboardManager
 import android.content.Context
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -30,7 +28,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import java.text.DateFormat
 import java.util.Date
@@ -193,6 +190,23 @@ internal fun ProfilesScreen(
     }
 }
 
+/**
+ * Скругления элемента группы: крайние элементы получают большой радиус (24dp),
+ * внутренние — малый (6dp). Для одиночного элемента (count == 1) скругляются все углы большим радиусом.
+ */
+internal fun groupedShape(index: Int, count: Int): RoundedCornerShape {
+    val outer = 24.dp
+    val inner = 6.dp
+    val isFirst = index == 0
+    val isLast = index >= count - 1
+    return RoundedCornerShape(
+        topStart = if (isFirst) outer else inner,
+        topEnd = if (isFirst) outer else inner,
+        bottomStart = if (isLast) outer else inner,
+        bottomEnd = if (isLast) outer else inner,
+    )
+}
+
 @Composable
 private fun SubscriptionHeader(subscription: SubscriptionConfig, refreshing: Boolean, refreshEnabled: Boolean,
     onRefresh: () -> Unit, onDelete: () -> Unit, modifier: Modifier = Modifier,
@@ -232,42 +246,6 @@ private fun SubscriptionHeader(subscription: SubscriptionConfig, refreshing: Boo
     }
 }
 
-@Composable
-private fun ProfileCard(config: ServerConfig, index: Int, count: Int, selected: Boolean, pingMs: Long?, pinging: Boolean,
-    onSelect: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit, modifier: Modifier = Modifier,
-) {
-    val scheme = MaterialTheme.colorScheme
-    val container by animateColorAsState(
-        if (selected) scheme.secondaryContainer else scheme.surfaceContainerLow,
-        spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow), label = "profile selection",
-    )
-    val border by animateColorAsState(if (selected) scheme.primary else Color.Transparent, spring(), label = "profile outline")
-    val details = remember(config) { profileBadges(config) }
-    Card(onClick = onSelect, shape = groupedShape(index, count), colors = CardDefaults.cardColors(
-        containerColor = container, contentColor = if (selected) scheme.onSecondaryContainer else scheme.onSurface),
-        border = BorderStroke(1.dp, border), modifier = modifier.fillMaxWidth().semantics {
-            this.selected = selected
-            role = Role.RadioButton
-        }) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(if (selected) Icons.Rounded.CheckCircle else Icons.Rounded.Dns, null,
-                    tint = if (selected) scheme.primary else scheme.onSurfaceVariant)
-                Column(Modifier.weight(1f)) {
-                    Text(config.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    FlowRow(Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        ProfileBadge(config.protocol.uppercase())
-                        details.forEach { ProfileBadge(it) }
-                    }
-                }
-                IconButton(onClick = onEdit, modifier = Modifier.size(36.dp)) { Icon(Icons.Rounded.Edit, "Переименовать ${config.name}") }
-                IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) { Icon(Icons.Rounded.DeleteOutline, "Удалить ${config.name}") }
-            }
-        }
-    }
-}
-
 /** Read existing parser metadata for display only; never mutates or reinterprets a profile. */
 internal fun profileBadges(config: ServerConfig): List<String> {
     val values = config.rawUrl?.let { runCatching { ServerLinkParser.parseRawLink(it).values }.getOrNull() }.orEmpty()
@@ -280,13 +258,6 @@ internal fun profileBadges(config: ServerConfig): List<String> {
         ?: values["security"] ?: values["tls"]
     return listOfNotNull(transport?.takeIf { it.isNotBlank() && it != "none" }?.uppercase(),
         security?.takeIf { it.isNotBlank() && it != "none" }?.uppercase()).distinct()
-}
-
-@Composable
-private fun ProfileBadge(text: String) {
-    Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-        Text(text, Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall)
-    }
 }
 
 @Composable
@@ -303,7 +274,9 @@ private fun PingChip(ping: Long?, busy: Boolean) {
     Surface(shape = CircleShape, color = lerp(scheme.surfaceContainer, hue, 0.13f), contentColor = hue) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            if (busy) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+            if (busy) ExpressiveWavyIndicator(
+                Modifier.width(40.dp), color = hue, amplitude = 2.dp, wavelength = 14.dp, strokeWidth = 3.dp,
+            )
             else Icon(Icons.Rounded.NetworkCheck, null, Modifier.size(16.dp))
             Text(when { busy -> "Проверяем…"; ping == null -> "Нет замера"; ping < 0 -> "Недоступен"; else -> "$ping мс" },
                 style = MaterialTheme.typography.labelMedium)
@@ -321,9 +294,11 @@ private fun EmptyProfiles(onClipboard: () -> Unit, onAdd: () -> Unit) {
         Text("Здесь начнётся подключение", Modifier.padding(top = 24.dp), style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
         Text("Скопируйте ссылку или JSON-конфигурацию и добавьте свой первый профиль.", Modifier.padding(top = 12.dp, bottom = 24.dp),
             style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-        Button(onClick = onClipboard, modifier = Modifier.heightIn(min = 52.dp)) {
-            Icon(Icons.Rounded.ContentPaste, null); Spacer(Modifier.width(8.dp)); Text("Добавить из буфера")
-        }
+        ExpressiveActionButton(
+            text = "Добавить из буфера",
+            onClick = onClipboard,
+            icon = { Icon(Icons.Rounded.ContentPaste, null) },
+        )
         TextButton(onClick = onAdd) { Text("Ввести конфигурацию вручную") }
     }
 }
@@ -341,10 +316,12 @@ private fun ImportProfileSheet(onDismiss: () -> Unit, onImport: (String) -> Unit
             .imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
             Icon(Icons.Rounded.AddLink, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
             Text("Новый профиль", Modifier.padding(top = 16.dp), style = MaterialTheme.typography.headlineSmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = !subscriptionMode, onClick = { subscriptionMode = false; error = null }, label = { Text("Сервер") })
-                FilterChip(selected = subscriptionMode, onClick = { subscriptionMode = true; error = null }, label = { Text("Подписка по URL") })
-            }
+            ExpressiveButtonGroup(
+                options = listOf("Сервер", "Подписка по URL"),
+                selectedIndex = if (subscriptionMode) 1 else 0,
+                onSelect = { subscriptionMode = it == 1; error = null },
+                modifier = Modifier.fillMaxWidth(),
+            )
             Text(if (subscriptionMode) "Вставьте HTTP- или HTTPS-ссылку на подписку." else "Вставьте ссылку на сервер или JSON-конфигурацию.",
                 Modifier.padding(top = 8.dp, bottom = 20.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedTextField(value = text, onValueChange = { text = it; error = null }, label = { Text(if (subscriptionMode) "URL подписки" else "Ссылка или JSON") },
@@ -356,16 +333,20 @@ private fun ImportProfileSheet(onDismiss: () -> Unit, onImport: (String) -> Unit
                 val pasted = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(context)?.toString() else null
                 if (pasted.isNullOrBlank()) error = "Буфер обмена пуст" else { text = pasted; error = null }
             }) { Icon(Icons.Rounded.ContentPaste, null); Spacer(Modifier.width(8.dp)); Text("Вставить из буфера") }
-            Button(onClick = {
-                if (subscriptionMode) onAddSubscription(text.trim())
-                else {
-                    // Only valid input dismisses the sheet.
-                    runCatching { parseProfileImport(text) }.onSuccess { onImport(text) }
-                        .onFailure { error = it.message ?: "Не удалось прочитать профиль" }
-                }
-            }, enabled = text.isNotBlank(), modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                Text(if (subscriptionMode) "Добавить подписку" else "Добавить профиль")
-            }
+            ExpressiveActionButton(
+                text = if (subscriptionMode) "Добавить подписку" else "Добавить профиль",
+                onClick = {
+                    if (subscriptionMode) onAddSubscription(text.trim())
+                    else {
+                        // Only valid input dismisses the sheet.
+                        if (isSubscriptionUrl(text)) onAddSubscription(text.trim())
+                        else runCatching { parseProfileImport(text) }.onSuccess { onImport(text) }
+                            .onFailure { error = it.message ?: "Не удалось прочитать профиль" }
+                    }
+                },
+                enabled = text.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
     }
 }

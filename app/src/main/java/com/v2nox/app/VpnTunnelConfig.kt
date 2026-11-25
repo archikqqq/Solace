@@ -1,5 +1,6 @@
 package com.v2nox.app
 
+import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.InetSocketAddress
@@ -10,7 +11,11 @@ internal class VpnTunnelConfig private constructor(
     val socks: LocalSocks,
     private val rawConfig: JSONObject?,
 ) {
-    fun xrayConfig(config: ServerConfig): String = rawConfig?.toString() ?: JSONObject().apply {
+    fun xrayConfig(
+        config: ServerConfig,
+        context: Context? = null,
+        routeRussiaDirect: Boolean = false,
+    ): String = rawConfig?.toString() ?: JSONObject().apply {
         put("log", JSONObject().put("loglevel", "warning"))
         val account = JSONObject().put("user", socks.username).put("pass", socks.password)
         val settings = JSONObject()
@@ -32,18 +37,20 @@ internal class VpnTunnelConfig private constructor(
             .put(JSONObject().put("address", "https://$DNS_IPV4/dns-query"))
             .put(JSONObject().put("address", "8.8.8.8").put("tag", "dns-domestic")
                 .put("domains", directDomains).put("skipFallback", true))))
-        val outbounds = buildXrayOutbounds(config)
+        val outbounds = buildXrayOutbounds(config, routeRussiaDirect)
         put("outbounds", outbounds.put(JSONObject().put("tag", "dns-out").put("protocol", "dns")
             .put("settings", JSONObject().put("rules", JSONArray()
                 .put(JSONObject().put("action", "hijack").put("qType", "1,28"))
                 .put(JSONObject().put("action", "return").put("rCode", 5))))))
         fun rule(tag: String) = JSONObject().put("type", "field").put("outboundTag", tag)
-        put("routing", JSONObject().put("domainStrategy", "IPIfNonMatch").put("rules", JSONArray()
+        val routing = JSONObject().put("domainStrategy", "IPIfNonMatch").put("rules", JSONArray()
             .put(rule("dns-out").put("inboundTag", JSONArray().put("tun-in")).put("port", 53))
             .put(rule("direct").put("inboundTag", JSONArray().put("dns-domestic")))
             .put(rule("proxy").put("ip", JSONArray().put(DNS_IPV4)).put("port", 443))
             .put(rule("direct").put("domain", directDomains))
-            .put(rule("direct").put("ip", JSONArray().put("geoip:private")))))
+            .put(rule("direct").put("ip", JSONArray().put("geoip:private"))))
+        applyRussiaRouting(context, routing, routeRussiaDirect)
+        put("routing", routing)
     }.toString()
 
     fun hevConfig(): String = """

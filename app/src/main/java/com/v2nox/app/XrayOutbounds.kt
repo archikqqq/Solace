@@ -1,10 +1,13 @@
 package com.v2nox.app
 
+import android.content.Context
+import java.io.File
+import java.io.OutputStream
 import org.json.JSONArray
 import org.json.JSONObject
 
 /** Selects only outbounds; the VPN owns its inbounds, routing and direct outbound. */
-internal fun buildXrayOutbounds(config: ServerConfig): JSONArray {
+internal fun buildXrayOutbounds(config: ServerConfig, routeRussiaDirect: Boolean = false): JSONArray {
     val outbounds = config.outboundJson?.let { raw ->
         val bundle = JSONObject(raw)
         val primary = bundle.getJSONObject("outbound")
@@ -32,9 +35,66 @@ internal fun buildXrayOutbounds(config: ServerConfig): JSONArray {
         }
         JSONArray().apply { objects.forEach { put(it) } }
     } ?: JSONArray().put(buildLinkOutbound(config))
-    return outbounds.put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
+    return ensureDirectOutbound(outbounds)
 }
 
+/** Guarantees a freedom outbound tagged "direct" exists (added only when missing). */
+internal fun ensureDirectOutbound(outbounds: JSONArray): JSONArray {
+    val exists = (0 until outbounds.length()).any { outbounds.optJSONObject(it)?.optString("tag") == "direct" }
+    return if (exists) outbounds else outbounds.put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
+}
+
+/**
+ * Sets domainStrategy and, when [routeRussiaDirect] is true, inserts Russian "direct" rules.
+ * Domains and IPs go into separate rules because Xray ANDs the fields within one rule.
+ * The rules follow the local/private rules and precede any catch-all proxy rule.
+ * Geo tags are used only if the matching .dat file really contains them; regexp rules always apply.
+ */
+internal fun applyRussiaRouting(context: Context?, routing: JSONObject, routeRussiaDirect: Boolean) {
+    routing.put("domainStrategy", "IPIfNonMatch")
+    if (!routeRussiaDirect) return
+    val domains = JSONArray()
+        .put("regexp:.*\\.ru$")
+        .put("regexp:.*\\.\u0440\u0444$")
+        .put("domain:su")
+    if (hasGeoTag(context, "geosite.dat", "CATEGORY-RU")) domains.put("geosite:category-ru")
+    val inserted = mutableListOf(
+        JSONObject().put("type", "field").put("outboundTag", "direct").put("domain", domains),
+    )
+    if (hasGeoTag(context, "geoip.dat", "RU")) {
+        inserted += JSONObject().put("type", "field").put("outboundTag", "direct")
+            .put("ip", JSONArray().put("geoip:ru"))
+    }
+    val rules = routing.optJSONArray("rules") ?: JSONArray()
+    val existing = (0 until rules.length()).map { rules.get(it) }
+    val position = existing.indexOfLast { it is JSONObject && isPrivateRule(it) } + 1
+    val merged = JSONArray()
+    existing.take(position).forEach { merged.put(it) }
+    inserted.forEach { merged.put(it) }
+    existing.drop(position).forEach { merged.put(it) }
+    routing.put("rules", merged)
+}
+
+private val PRIVATE_GEO_TAGS = setOf("geosite:private", "geoip:private")
+
+private fun isPrivateRule(rule: JSONObject): Boolean = listOf("domain", "ip").any { key ->
+    val values = rule.optJSONArray(key) ?: return@any false
+    (0 until values.length()).any { values.optString(it) in PRIVATE_GEO_TAGS }
+}
+
+/** True only if [context] is available and [file] contains the geo [code]; any failure counts as absent. */
+private fun hasGeoTag(context: Context?, file: String, code: String): Boolean {
+    if (context == null) return false
+    return runCatching {
+        val installed = File(context.filesDir, file)
+        val source = if (installed.isFile) installed.inputStream() else context.assets.open(file)
+        source.use { XrayGeoAssets.slice(it, DiscardingOutput, setOf(code)).isEmpty() }
+    }.getOrDefault(false)
+}
+
+private object DiscardingOutput : OutputStream() {
+    override fun write(b: Int) = Unit
+}
 private fun buildLinkOutbound(config: ServerConfig): JSONObject {
     val rawUrl = config.rawUrl ?: error("У профиля отсутствуют ссылка и JSON-конфигурация")
     val link = ServerLinkParser.parseRawLink(rawUrl)

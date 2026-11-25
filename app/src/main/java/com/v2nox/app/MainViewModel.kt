@@ -36,6 +36,7 @@ data class MainUiState(
     val pingResults: Map<String, Long> = emptyMap(),
     val pingingServerId: String? = null,
     val isPingingAll: Boolean = false,
+    val routeRussiaDirect: Boolean = false,
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -43,6 +44,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<MainUiState> = mutableUiState.asStateFlow()
     private val serverRepository = ServerRepository(application)
     private val subscriptionRepository = SubscriptionRepository(application)
+    private val appearanceRepository = AppearanceRepository(application)
 
     private val mutablePermissionRequests = MutableSharedFlow<Intent>(extraBufferCapacity = 1)
     val permissionRequests: SharedFlow<Intent> = mutablePermissionRequests.asSharedFlow()
@@ -54,6 +56,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var lastPingTarget: Triple<String, String, Int>? = null
 
     init {
+        viewModelScope.launch {
+            appearanceRepository.settings
+                .catch { }
+                .collect { settings ->
+                    mutableUiState.value = mutableUiState.value.copy(routeRussiaDirect = settings.routeRussiaDirect)
+                }
+        }
         viewModelScope.launch {
             subscriptionRepository.subscriptions
                 .catch { mutableUiState.value = mutableUiState.value.copy(errorMessage = "Не удалось загрузить подписки") }
@@ -96,7 +105,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         override fun onServiceDisconnected(name: ComponentName?) { service = null }
     }
 
+    fun setRouteRussiaDirect(enabled: Boolean) {
+        mutableUiState.value = mutableUiState.value.copy(routeRussiaDirect = enabled)
+        viewModelScope.launch {
+            try {
+                appearanceRepository.setRouteRussiaDirect(enabled)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                mutableUiState.value = mutableUiState.value.copy(errorMessage = "Не удалось сохранить настройку маршрутизации")
+            }
+        }
+    }
+
     fun importFromClipboard(text: String) {
+        if (isSubscriptionUrl(text)) {
+            addSubscription(text.trim())
+            return
+        }
         runCatching { parseProfileImport(text) }
             .onSuccess { parsed ->
                 val existing = mutableUiState.value.savedConfigs

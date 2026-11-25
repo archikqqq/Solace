@@ -33,6 +33,10 @@ internal object XrayGeoAssets {
         }
     }
 
+    /** True if the geodata file is installed in filesDir or bundled in assets (same lookup as [prepare]). */
+    fun isInstalled(context: Context, name: String): Boolean =
+        File(context.filesDir, name).isFile || runCatching { context.assets.open(name).close() }.isSuccess
+
     internal fun references(root: JSONObject): Map<String, Set<String>> {
         val result = linkedMapOf<String, MutableSet<String>>()
         val listKeys = setOf("domain", "domains", "ip", "source", "sourceip", "localip", "expectedips",

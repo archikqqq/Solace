@@ -15,6 +15,7 @@ internal data class AppearanceSettings(
     val followSystem: Boolean = true,
     val darkTheme: Boolean = false,
     val dynamicColor: Boolean = true,
+    val routeRussiaDirect: Boolean = false,
 )
 
 /** UI-only preferences, deliberately separate from server/VPN configuration. */
@@ -27,16 +28,19 @@ internal class AppearanceRepository(context: Context) {
             followSystem = preferences[FOLLOW_SYSTEM] ?: true,
             darkTheme = preferences[DARK_THEME] ?: false,
             dynamicColor = preferences[DYNAMIC_COLOR] ?: true,
+            routeRussiaDirect = preferences[ROUTE_RUSSIA_DIRECT] ?: false,
         )
     }
 
     suspend fun setFollowSystem(value: Boolean) { dataStore.edit { it[FOLLOW_SYSTEM] = value } }
     suspend fun setDarkTheme(value: Boolean) { dataStore.edit { it[DARK_THEME] = value } }
     suspend fun setDynamicColor(value: Boolean) { dataStore.edit { it[DYNAMIC_COLOR] = value } }
+    suspend fun setRouteRussiaDirect(value: Boolean) { dataStore.edit { it[ROUTE_RUSSIA_DIRECT] = value } }
 
     private companion object {
         val FOLLOW_SYSTEM = booleanPreferencesKey("follow_system")
         val DARK_THEME = booleanPreferencesKey("dark_theme")
         val DYNAMIC_COLOR = booleanPreferencesKey("dynamic_color")
+        val ROUTE_RUSSIA_DIRECT = booleanPreferencesKey("route_russia_direct")
     }
 }
